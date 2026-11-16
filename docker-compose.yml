@@ -1,19 +1,34 @@
 # Docker Compose：一键启动双端 FASTQ 配对修复服务
 #   docker compose up --build
 # 浏览器访问 http://localhost:8000
+#
+# 两个独立卷：
+#   fastq_data    /data     处理卷：上传件、结果原件、SQLite 登记库
+#   fastq_archive /archive  归档卷：已完成任务的四份 gzip 结果副本
+# 两个卷都挂载后即可在详情页执行“归档”，归档后原下载链接保持不变。
 services:
   web:
     build: .
     ports:
       - "8000:8000"
     volumes:
-      - fastq_data:/data          # 数据卷：上传文件、结果、SQLite 登记库
-    mem_limit: 128m               # 容器内存上限 128 MiB
+      - fastq_data:/data          # 处理卷：上传文件、结果原件、SQLite 登记库
+      - fastq_archive:/archive    # 归档卷：四份结果归档副本（独立目录）
+    mem_limit: 128m               # 容器内存上限 128 MiB（归档流式复制 1 MiB 缓冲）
     memswap_limit: 128m
     environment:
+      DATA_DIR: /data
+      ARCHIVE_DIR: /archive
       MAX_DECOMP_BYTES: "268435456"   # 每份文件解压后上限 256 MiB
       # SECRET_KEY: "请在生产环境设置"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
 
 volumes:
   fastq_data:
+  fastq_archive:

@@ -28,6 +28,9 @@
     .st-failed     { background: #fee2e2; color: var(--bad); }
     .st-processing { background: #dbeafe; color: var(--run); }
     .st-queued     { background: #fef9c3; color: var(--wait); }
+    .st-archived   { background: #e0e7ff; color: #3730a3; }
+    .st-copying    { background: #dbeafe; color: var(--run); }
+    .st-copied     { background: #fef3c7; color: #92400e; }
     .num { font-variant-numeric: tabular-nums; text-align: right; }
     .btn { display: inline-block; padding: 6px 14px; border-radius: 6px; border: 1px solid #cbd5e1;
            background: #fff; color: #1f2933; text-decoration: none; font-size: 13px; cursor: pointer; }
@@ -37,6 +40,7 @@
     .btn[disabled] { opacity: .45; pointer-events: none; }
     .flash { padding: 10px 14px; border-radius: 6px; margin-bottom: 16px; font-size: 14px; }
     .flash.error { background: #fee2e2; color: var(--bad); }
+    .flash.ok { background: #dcfce7; color: var(--ok); }
     .muted { color: #64748b; font-size: 12px; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
     .err { background: #fef2f2; border: 1px solid #fecaca; color: #7f1d1d;
@@ -50,6 +54,8 @@
     input[type=file] { font-size: 13px; }
     .form-row { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-end; }
     .field label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+    form.inline { display: inline; }
+    .path { word-break: break-all; }
   </style>
 </head>
 <body>

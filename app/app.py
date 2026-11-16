@@ -3,7 +3,8 @@
 
 - 上传 R1/R2 两份 gzip FASTQ，后台流式配对；
 - 全部结果文件发布且 SQLite 登记成功后才开放下载；
-- 失败不暴露任何部分结果；重启时清理中断任务的未完成产物。
+- 失败不暴露任何部分结果；重启时清理中断任务的未完成产物；
+- 可将已完成任务的四份结果归档到独立卷，登记成功后才回收原件。
 """
 import os
 import shutil
@@ -17,12 +18,16 @@ from flask import (Flask, abort, flash, g, redirect, render_template,
 from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 
+import archive
 import pipeline
 
 DATA_DIR = os.path.abspath(os.environ.get(
     "DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")))
 JOBS_DIR = os.path.join(DATA_DIR, "jobs")
 DB_PATH = os.path.join(DATA_DIR, "app.db")
+# 归档独立目录（compose 中为另一个卷挂载到 /archive）
+ARCHIVE_DIR = os.path.abspath(os.environ.get(
+    "ARCHIVE_DIR", os.path.join(os.path.dirname(DATA_DIR), "archive")))
 
 # 解压后上限（默认 256 MiB，可用环境变量覆盖以便测试）
 MAX_DECOMP_BYTES = int(os.environ.get(
@@ -38,9 +43,23 @@ OUTPUTS = {
     "unpaired_r2": "缺端 R2（R1 中无配对）",
 }
 
+STATUS_LABELS = {
+    "queued": "排队中", "processing": "处理中",
+    "done": "完成", "failed": "失败",
+}
+# 归档状态：'': 未归档；copying: 复制/登记中；copied: 已归档待回收；
+# archived: 已归档且原件已回收
+ARCHIVE_LABELS = {
+    "": "未归档", "copying": "归档中", "copied": "归档完成·待回收原件",
+    "archived": "已归档",
+}
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
 app.secret_key = os.environ.get("SECRET_KEY", "fastq-pairer-dev-secret")
+
+archiver = archive.Archiver(JOBS_DIR, ARCHIVE_DIR, lambda: connect_db(),
+                            logger=app.logger.info)
 
 
 # ---------------- SQLite 登记库 ----------------
@@ -69,6 +88,7 @@ def close_db(_exc):
 def init_and_recover():
     """建表 + 启动恢复：中断任务标记失败并清理其未完成产物。"""
     os.makedirs(JOBS_DIR, exist_ok=True)
+    os.makedirs(ARCHIVE_DIR, exist_ok=True)
     con = connect_db()
     con.execute(
         """CREATE TABLE IF NOT EXISTS jobs(
@@ -79,6 +99,15 @@ def init_and_recover():
                r1_name TEXT NOT NULL DEFAULT '',
                r2_name TEXT NOT NULL DEFAULT '',
                paired INTEGER, r1_only INTEGER, r2_only INTEGER)""")
+    # 归档相关列（旧库就地升级）
+    existing = {r["name"] for r in con.execute("PRAGMA table_info(jobs)")}
+    for col, decl in (
+            ("archive_status", "TEXT NOT NULL DEFAULT ''"),
+            ("archive_meta", "TEXT NOT NULL DEFAULT ''"),
+            ("archive_time", "TEXT NOT NULL DEFAULT ''"),
+            ("archive_error", "TEXT NOT NULL DEFAULT ''")):
+        if col not in existing:
+            con.execute(f"ALTER TABLE jobs ADD COLUMN {col} {decl}")
     con.commit()
     interrupted = [r["id"] for r in con.execute(
         "SELECT id FROM jobs WHERE status IN ('queued','processing')")]
@@ -87,7 +116,7 @@ def init_and_recover():
         shutil.rmtree(os.path.join(job_dir, "work"), ignore_errors=True)
         shutil.rmtree(os.path.join(job_dir, "out"), ignore_errors=True)
         con.execute(
-            "UPDATE jobs SET status='failed', "
+            "UPDATE jobs SET status='failed', archive_status='', "
             "message='服务重启导致任务中断，未完成产物已清理' WHERE id=?", (jid,))
     con.commit()
     known = {r["id"] for r in con.execute("SELECT id FROM jobs")}
@@ -95,8 +124,37 @@ def init_and_recover():
         if name not in known:
             shutil.rmtree(os.path.join(JOBS_DIR, name), ignore_errors=True)
     con.close()
+    resumed = archiver.recover()
     if interrupted:
         app.logger.info("已清理 %d 个中断任务", len(interrupted))
+    if resumed:
+        app.logger.info("已继续 %d 个未完成的归档任务", resumed)
+
+
+# ---------------- 归档 ----------------
+
+def archive_state(job):
+    """详情页展示用：(状态码, 文案, 是否允许再次归档)。"""
+    if job["status"] != "done":
+        return "", "", False
+    state = job["archive_status"] or ""
+    return (state, ARCHIVE_LABELS.get(state, state),
+            state in ("", "copied"))
+
+
+def result_path(job, key):
+    """任务结果的当前有效路径：优先处理卷原件，否则归档卷副本。
+
+    返回 (path, 是否来自归档卷)；两者都不存在时返回 (None, False)。
+    """
+    name = pipeline.OUTPUT_FILES[key]
+    src = os.path.join(JOBS_DIR, job["id"], "out", name)
+    if os.path.isfile(src):
+        return src, False
+    dst = os.path.join(ARCHIVE_DIR, job["id"], name)
+    if os.path.isfile(dst):
+        return dst, True
+    return None, False
 
 
 # ---------------- 后台处理 ----------------
@@ -118,7 +176,8 @@ def process_job(jid):
         # 结果文件已全部落盘，最后登记；若此处失败则走 except 删除结果
         con.execute(
             "UPDATE jobs SET status='done', paired=?, r1_only=?, r2_only=?, "
-            "message='' WHERE id=?",
+            "message='', archive_status='', archive_meta='', "
+            "archive_time='', archive_error='' WHERE id=?",
             (counts["paired"], counts["r1_only"], counts["r2_only"], jid))
         con.commit()
     except pipeline.PipelineError as e:
@@ -145,9 +204,18 @@ def process_job(jid):
 def index():
     jobs = get_db().execute(
         "SELECT * FROM jobs ORDER BY created_at DESC, id DESC LIMIT 200").fetchall()
-    active = any(j["status"] in ("queued", "processing") for j in jobs)
+    active = any(j["status"] in ("queued", "processing") or
+                 (j["status"] == "done" and
+                  j["archive_status"] == "copying") for j in jobs)
+    # 已归档但未回收（需要用户点“继续回收”或等重启恢复）单独统计，用于提示
+    pending = [j for j in jobs if j["status"] == "done"
+               and j["archive_status"] == "copied"]
     return render_template("index.html", jobs=jobs, active=active,
-                           max_mib=MAX_DECOMP_BYTES // (1024 * 1024))
+                           pending_cleanup=len(pending),
+                           max_mib=MAX_DECOMP_BYTES // (1024 * 1024),
+                           archive_dir=ARCHIVE_DIR,
+                           status_labels=STATUS_LABELS,
+                           archive_labels=ARCHIVE_LABELS)
 
 
 @app.route("/jobs", methods=["POST"])
@@ -179,25 +247,63 @@ def job_detail(jid):
     job = get_db().execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone()
     if job is None:
         abort(404)
+    state, label, can_archive = archive_state(job)
     return render_template("job.html", job=job, outputs=OUTPUTS,
-                           output_files=pipeline.OUTPUT_FILES)
+                           output_files=pipeline.OUTPUT_FILES,
+                           status_labels=STATUS_LABELS,
+                           archive_state=state, archive_label=label,
+                           can_archive=can_archive,
+                           archive_dir=ARCHIVE_DIR)
+
+
+@app.route("/jobs/<jid>/archive", methods=["POST"])
+def archive_job(jid):
+    job = get_db().execute(
+        "SELECT status, archive_status FROM jobs WHERE id=?", (jid,)).fetchone()
+    if job is None:
+        abort(404)
+    state = job["archive_status"] or ""
+    if job["status"] != "done":
+        flash("只有已完成的任务可以归档", "error")
+    elif state == "archived":
+        flash("该任务已经归档，无需重复操作", "error")
+    elif state == "copying":
+        flash("该任务正在归档中，请勿重复提交", "error")
+    elif archiver.start(jid):
+        if state == "copied":
+            flash("已继续回收处理卷原件（归档副本校验通过后执行）", "ok")
+        else:
+            flash("已开始归档：结果将复制到归档卷，校验登记成功后才回收原件", "ok")
+    else:
+        flash("该任务已进入归档流程，请勿重复提交", "error")
+    return redirect(url_for("job_detail", jid=jid))
 
 
 @app.route("/jobs/<jid>/download/<key>")
 def download(jid, key):
     if key not in OUTPUTS:
         abort(404)
-    job = get_db().execute("SELECT status FROM jobs WHERE id=?", (jid,)).fetchone()
+    job = get_db().execute(
+        "SELECT id, status FROM jobs WHERE id=?", (jid,)).fetchone()
     if job is None:
         abort(404)
     if job["status"] != "done":
         # 未完成/失败任务一律不暴露产物
         abort(409)
-    path = os.path.join(JOBS_DIR, jid, "out", pipeline.OUTPUT_FILES[key])
-    if not os.path.isfile(path):
-        abort(404)
-    return send_file(path, mimetype="application/gzip", as_attachment=True,
-                     download_name=f"{jid}_{pipeline.OUTPUT_FILES[key]}")
+    # 处理卷原件与归档卷副本任一存在即可下载；归档回收不中断下载。
+    # 极小的“检查-打开”间隙里文件可能刚被回收：重试一次并改走另一份副本。
+    for attempt in (0, 1):
+        path, _from_archive = result_path(job, key)
+        if path is None:
+            abort(404)
+        try:
+            return send_file(
+                path, mimetype="application/gzip", as_attachment=True,
+                download_name=f"{jid}_{pipeline.OUTPUT_FILES[key]}")
+        except FileNotFoundError:
+            if attempt:
+                break
+    abort(404)
 
 
 @app.route("/healthz")

@@ -17,28 +17,39 @@
         <button class="btn btn-primary" type="submit">上传并开始配对</button>
       </div>
     </div>
-    <p class="muted">每份文件解压后不超过 {{ max_mib }} MiB；同侧 ID 重复或四行记录非法将整批失败。</p>
+    <p class="muted">每份文件解压后不超过 {{ max_mib }} MiB；同侧 ID 重复或四行记录非法将整批失败。
+      完成任务可在详情页归档到 <span class="mono path">{{ archive_dir }}</span>。</p>
   </form>
 </div>
 
 <div class="card">
   <h2>任务列表{% if active %} <span class="muted">（处理中，页面每 4 秒自动刷新）</span>{% endif %}</h2>
+  {% if pending_cleanup %}
+  <p class="muted">有 {{ pending_cleanup }} 个任务已归档但处理卷原件待回收：
+    归档副本已校验登记，可在详情页点“继续回收原件”，服务重启也会自动继续。</p>
+  {% endif %}
   {% if jobs %}
   <table>
     <thead>
       <tr>
         <th>任务 ID</th><th>提交时间</th><th>R1 文件</th><th>R2 文件</th>
-        <th>状态</th><th class="num">配对数</th><th class="num">缺端 R1</th><th class="num">缺端 R2</th><th></th>
+        <th>状态</th><th>归档</th><th class="num">配对数</th><th class="num">缺端 R1</th><th class="num">缺端 R2</th><th></th>
       </tr>
     </thead>
     <tbody>
       {% for j in jobs %}
+      {% set astate = j.archive_status if j.status == "done" else "" %}
       <tr>
         <td class="mono">{{ j.id }}</td>
         <td class="mono">{{ j.created_at }}</td>
         <td>{{ j.r1_name }}</td>
         <td>{{ j.r2_name }}</td>
-        <td><span class="badge st-{{ j.status }}">{{ {"queued":"排队中","processing":"处理中","done":"完成","failed":"失败"}[j.status] }}</span></td>
+        <td><span class="badge st-{{ j.status }}">{{ status_labels[j.status] }}</span></td>
+        <td>
+          {% if j.status == "done" and astate %}
+          <span class="badge st-{{ astate }}">{{ archive_labels[astate] }}</span>
+          {% else %}<span class="muted">—</span>{% endif %}
+        </td>
         <td class="num">{{ j.paired if j.paired is not none else "—" }}</td>
         <td class="num">{{ j.r1_only if j.r1_only is not none else "—" }}</td>
         <td class="num">{{ j.r2_only if j.r2_only is not none else "—" }}</td>
